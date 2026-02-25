@@ -137,3 +137,12 @@ code/.idea/
 .DS_Store
 ._.DS_Store
 .idea/
+
+# Local data
+data/Changwei8/
+data/__MACOSX/
+data/collect_frames.py
+
+# UV/Python tools
+uv.lock
+.venv/

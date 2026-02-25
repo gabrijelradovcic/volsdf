@@ -28,6 +28,34 @@ def load_rgb(path, normalize_rgb = False):
     return img
 
 
+def load_mask(path, threshold=0.5):
+    """
+    Load a mask image and convert to boolean array.
+    
+    Args:
+        path: Path to mask image
+        threshold: Threshold for binarization (for non-binary masks)
+    
+    Returns:
+        mask: Boolean numpy array (H, W) or (H*W,) flattened
+    """
+    mask = imageio.imread(path)
+    
+    # Handle different mask formats
+    if len(mask.shape) == 3:
+        # Multi-channel: use first channel or convert to grayscale
+        if mask.shape[2] == 4:  # RGBA
+            mask = mask[:, :, 3]  # Use alpha channel
+        else:
+            mask = mask[:, :, 0]  # Use first channel
+    
+    # Convert to float and threshold
+    mask = skimage.img_as_float32(mask)
+    mask = mask > threshold
+    
+    return mask
+
+
 def load_K_Rt_from_P(filename, P=None):
     if P is None:
         lines = open(filename).read().splitlines()
