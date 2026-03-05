@@ -187,7 +187,7 @@ class RenderingNetwork(nn.Module):
         return x
 
 class VolSDFNetwork(nn.Module):
-    def __init__(self, conf):
+    def __init__(self, conf, num_frames=1, init_poses=None):
         super().__init__()
         self.feature_vector_size = conf.get_int('feature_vector_size')
         self.scene_bounding_sphere = conf.get_float('scene_bounding_sphere', default=1.0)
@@ -199,12 +199,20 @@ class VolSDFNetwork(nn.Module):
 
         self.density = LaplaceDensity(**conf.get_config('density'))
         self.ray_sampler = ErrorBoundSampler(self.scene_bounding_sphere, **conf.get_config('ray_sampler'))
+        
+        # Object pose (for multi-frame)
+        self.object_pose = None
+        if num_frames > 1 and init_poses is not None:
+            from model.object_pose import ObjectPoseParams
+            self.object_pose = ObjectPoseParams(num_frames, init_poses)
+            print(f"Initialized object poses for {num_frames} frames")
 
     def forward(self, input):
         # Parse model input
         intrinsics = input["intrinsics"]
         uv = input["uv"]
         pose = input["pose"]
+        frame_idx = input.get("frame_idx", None)
 
         ray_dirs, cam_loc = rend_util.get_camera_params(uv, pose, intrinsics)
 
@@ -213,14 +221,29 @@ class VolSDFNetwork(nn.Module):
         cam_loc = cam_loc.unsqueeze(1).repeat(1, num_pixels, 1).reshape(-1, 3)
         ray_dirs = ray_dirs.reshape(-1, 3)
 
+        # Transform rays to canonical space BEFORE the ray sampler.
+        # The ray sampler calls model.implicit_network.get_sdf_vals() internally, which
+        # expects canonical-space points. Without this, for any frame where the object has
+        # moved, the SDF evaluations are wrong and the sampler produces no surface hits.
+        # Convention: p_canonical = R^T @ (p_world - t)
+        if self.object_pose is not None and frame_idx is not None:
+            obj_pose = self.object_pose.get_pose(frame_idx)  # (B, 4, 4)
+            R = obj_pose[:, :3, :3]  # (B, 3, 3)
+            t = obj_pose[:, :3, 3]   # (B, 3)
+            # Expand to (B*num_pixels, ...)
+            R_exp = R.unsqueeze(1).expand(-1, num_pixels, -1, -1).reshape(-1, 3, 3)
+            t_exp = t.unsqueeze(1).expand(-1, num_pixels, -1).reshape(-1, 3)
+            # Transform ray origin and direction to canonical space
+            cam_loc  = torch.einsum('bij,bj->bi', R_exp.transpose(-1, -2), cam_loc - t_exp)
+            ray_dirs = torch.einsum('bij,bj->bi', R_exp.transpose(-1, -2), ray_dirs)
+            # ray_dirs stay unit vectors since R is orthogonal
+
+        # All subsequent operations are in canonical space
         z_vals, z_samples_eik = self.ray_sampler.get_z_vals(ray_dirs, cam_loc, self)
         N_samples = z_vals.shape[1]
 
-        points = cam_loc.unsqueeze(1) + z_vals.unsqueeze(2) * ray_dirs.unsqueeze(1)
-        points_flat = points.reshape(-1, 3)
-
-        dirs = ray_dirs.unsqueeze(1).repeat(1,N_samples,1)
-        dirs_flat = dirs.reshape(-1, 3)
+        points_flat = (cam_loc.unsqueeze(1) + z_vals.unsqueeze(2) * ray_dirs.unsqueeze(1)).reshape(-1, 3)
+        dirs_flat   = ray_dirs.unsqueeze(1).expand(-1, N_samples, -1).reshape(-1, 3)
 
         sdf, feature_vectors, gradients = self.implicit_network.get_outputs(points_flat)
 
@@ -241,16 +264,19 @@ class VolSDFNetwork(nn.Module):
         }
 
         if self.training:
-            # Sample points for the eikonal loss
+            # Sample points for the eikonal loss (already in canonical space)
             n_eik_points = batch_size * num_pixels
             eikonal_points = torch.empty(n_eik_points, 3).uniform_(-self.scene_bounding_sphere, self.scene_bounding_sphere).cuda()
 
-            # add some of the near surface points
+            # Near-surface eikonal points: cam_loc/ray_dirs are already canonical
             eik_near_points = (cam_loc.unsqueeze(1) + z_samples_eik.unsqueeze(2) * ray_dirs.unsqueeze(1)).reshape(-1, 3)
             eikonal_points = torch.cat([eikonal_points, eik_near_points], 0)
 
             grad_theta = self.implicit_network.gradient(eikonal_points)
             output['grad_theta'] = grad_theta
+            
+            if self.object_pose is not None:
+                output['pose_reg_loss'] = self.object_pose.reg_loss()
 
         if not self.training:
             gradients = gradients.detach()

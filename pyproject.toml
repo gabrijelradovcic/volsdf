@@ -12,9 +12,18 @@ dependencies = [
     "opencv-python>=4.13.0.90",
     "plotly>=6.5.2",
     "pyhocon>=0.3.61",
+    "pytorch3d>=0.7.9",
     "rtree>=1.4.1",
     "scikit-image>=0.25.2",
     "torchvision>=0.25.0",
     "tqdm>=4.67.1",
     "trimesh>=4.11.1",
 ]
+
+[[tool.uv.index]]
+name = "torch_custom"
+url = "https://miropsota.github.io/torch_packages_builder"
+explicit = true
+
+[tool.uv.sources]
+pytorch3d = { index = "torch_custom" }

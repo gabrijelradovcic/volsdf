@@ -3,6 +3,7 @@ from datetime import datetime
 from pyhocon import ConfigFactory
 import sys
 import torch
+import numpy as np
 from tqdm import tqdm
 
 import utils.general as utils
@@ -94,9 +95,28 @@ class VolSDFTrainRunner():
                                                            )
 
         conf_model = self.conf.get_config('model')
-        self.model = utils.get_class(self.conf.get_string('train.model_class'))(conf=conf_model)
+        
+        # Get multi-frame pose info
+        num_frames = getattr(self.train_dataset, 'n_frames', 1)
+        init_poses = None
+        if hasattr(self.train_dataset, 'get_obj_poses_for_frames'):
+            init_poses = self.train_dataset.get_obj_poses_for_frames()
+        
+        self.model = utils.get_class(self.conf.get_string('train.model_class'))(
+            conf=conf_model, num_frames=num_frames, init_poses=init_poses
+        )
         if torch.cuda.is_available():
             self.model.cuda()
+
+        # Setup single log file for tracking object poses over training
+        self.pose_log_path = os.path.join(self.expdir, self.timestamp, 'object_poses.log')
+        if hasattr(self.train_dataset, 'actual_frame_numbers'):
+            self.actual_frame_numbers = sorted(list(set(self.train_dataset.actual_frame_numbers)))
+        else:
+            self.actual_frame_numbers = None
+        # Write header and initial poses
+        self._init_pose_log()
+        self._save_object_poses(epoch=-1)
 
         self.loss = utils.get_class(self.conf.get_string('train.loss_class'))(**self.conf.get_config('loss'))
 
@@ -135,6 +155,12 @@ class VolSDFTrainRunner():
         self.split_n_pixels = self.conf.get_int('train.split_n_pixels', default=10000)
         self.plot_conf = self.conf.get_config('plot')
 
+        # Freeze object poses for the first N epochs
+        self.pose_freeze_epochs = self.conf.get_int('train.pose_freeze_epochs', default=0)
+        if self.pose_freeze_epochs > 0 and self.model.object_pose is not None:
+            self.model.object_pose.requires_grad_(False)
+            print(f'Object poses FROZEN for the first {self.pose_freeze_epochs} epochs')
+
     def save_checkpoints(self, epoch):
         torch.save(
             {"epoch": epoch, "model_state_dict": self.model.state_dict()},
@@ -157,13 +183,80 @@ class VolSDFTrainRunner():
             {"epoch": epoch, "scheduler_state_dict": self.scheduler.state_dict()},
             os.path.join(self.checkpoints_path, self.scheduler_params_subdir, "latest.pth"))
 
+    def _init_pose_log(self):
+        """Write header to the pose log file."""
+        if self.model.object_pose is None:
+            return
+        obj_pose_module = self.model.object_pose
+        n_frames = obj_pose_module.num_frames
+        frame_labels = self.actual_frame_numbers if self.actual_frame_numbers else list(range(n_frames))
+        
+        with open(self.pose_log_path, 'w') as f:
+            f.write(f"# Object pose log - {n_frames} frames\n")
+            f.write(f"# Actual frame numbers: {frame_labels}\n")
+            f.write(f"# Format: epoch | frame | tx ty tz | r1 r2 r3 r4 r5 r6 r7 r8 r9 | log_rep(6)\n")
+            f.write(f"# {'='*100}\n")
+            
+            # Write initial (reference) poses
+            if hasattr(obj_pose_module, 'init_poses'):
+                init_poses = obj_pose_module.init_poses.cpu().numpy()
+                f.write(f"# Initial poses from file:\n")
+                for i in range(n_frames):
+                    t = init_poses[i, :3, 3]
+                    R = init_poses[i, :3, :3].flatten()
+                    f.write(f"# init | frame {frame_labels[i]:>5d} | t=[{t[0]:.6f} {t[1]:.6f} {t[2]:.6f}] | R=[{' '.join(f'{v:.6f}' for v in R)}]\n")
+                f.write(f"# {'='*100}\n")
+
+    def _save_object_poses(self, epoch):
+        """Append current object poses for all frames to a single log file."""
+        if self.model.object_pose is None:
+            return
+        
+        obj_pose_module = self.model.object_pose
+        n_frames = obj_pose_module.num_frames
+        frame_labels = self.actual_frame_numbers if self.actual_frame_numbers else list(range(n_frames))
+        
+        with torch.no_grad():
+            frame_ids = torch.arange(n_frames).cuda()
+            current_poses = obj_pose_module.get_pose(frame_ids).cpu().numpy()  # (n_frames, 4, 4)
+            log_reps = obj_pose_module.pose_deltas(frame_ids).cpu().numpy()    # (n_frames, 6)
+        
+        with open(self.pose_log_path, 'a') as f:
+            for i in range(n_frames):
+                t = current_poses[i, :3, 3]
+                R = current_poses[i, :3, :3].flatten()
+                lr = log_reps[i]
+                f.write(f"{epoch:>6d} | frame {frame_labels[i]:>5d} | "
+                        f"t=[{t[0]:.6f} {t[1]:.6f} {t[2]:.6f}] | "
+                        f"R=[{' '.join(f'{v:.6f}' for v in R)}] | "
+                        f"log=[{' '.join(f'{v:.6f}' for v in lr)}]\n")
+        
+        # Print translation drift summary to terminal
+        if hasattr(obj_pose_module, 'init_poses'):
+            init_t = obj_pose_module.init_poses[:, :3, 3].cpu().numpy()
+            curr_t = current_poses[:, :3, 3]
+            drift = np.linalg.norm(curr_t - init_t, axis=-1)
+            print(f'  [Pose] epoch={epoch} | translation drift per frame: {np.array2string(drift, precision=4)}')
+
     def run(self):
         print("training...")
 
         for epoch in range(self.start_epoch, self.nepochs + 1):
 
+            # Unfreeze object poses after freeze period
+            if (epoch == self.pose_freeze_epochs 
+                    and self.model.object_pose is not None 
+                    and self.pose_freeze_epochs > 0):
+                self.model.object_pose.requires_grad_(True)
+                # Frame 0 stays fixed (handled in get_pose), but its embedding
+                # gradient won't affect anything. Keep it clean:
+                print(f'\n*** Epoch {epoch}: Object poses UNFROZEN ***\n')
+
             if epoch % self.checkpoint_freq == 0:
                 self.save_checkpoints(epoch)
+
+            # Save object poses every epoch
+            self._save_object_poses(epoch)
 
             if self.do_vis and epoch % self.plot_freq == 0:
                 self.model.eval()
@@ -174,6 +267,8 @@ class VolSDFTrainRunner():
                 model_input["intrinsics"] = model_input["intrinsics"].cuda()
                 model_input["uv"] = model_input["uv"].cuda()
                 model_input['pose'] = model_input['pose'].cuda()
+                if 'frame_idx' in model_input:
+                    model_input['frame_idx'] = model_input['frame_idx'].cuda()
 
                 split = utils.split_input(model_input, self.total_pixels, n_pixels=self.split_n_pixels)
                 res = []
@@ -204,6 +299,8 @@ class VolSDFTrainRunner():
                 model_input["intrinsics"] = model_input["intrinsics"].cuda()
                 model_input["uv"] = model_input["uv"].cuda()
                 model_input['pose'] = model_input['pose'].cuda()
+                if 'frame_idx' in model_input:
+                    model_input['frame_idx'] = model_input['frame_idx'].cuda()
 
                 model_outputs = self.model(model_input)
                 loss_output = self.loss(model_outputs, ground_truth)
@@ -216,11 +313,13 @@ class VolSDFTrainRunner():
 
                 psnr = rend_util.get_psnr(model_outputs['rgb_values'],
                                           ground_truth['rgb'].cuda().reshape(-1,3))
+                pose_reg = loss_output.get('pose_reg_loss', torch.tensor(0.0))
                 print(
-                    '{0}_{1} [{2}] ({3}/{4}): loss = {5}, rgb_loss = {6}, eikonal_loss = {7}, psnr = {8}'
+                    '{0}_{1} [{2}] ({3}/{4}): loss = {5}, rgb_loss = {6}, eikonal_loss = {7}, pose_reg = {8}, psnr = {9}'
                         .format(self.expname, self.timestamp, epoch, data_index, self.n_batches, loss.item(),
                                 loss_output['rgb_loss'].item(),
                                 loss_output['eikonal_loss'].item(),
+                                pose_reg.item(),
                                 psnr.item()))
 
                 self.train_dataset.change_sampling_idx(self.num_pixels)

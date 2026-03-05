@@ -105,7 +105,7 @@ def get_surface_trace(path, epoch, sdf, resolution=100, grid_boundary=[-2.0, 2.0
         z.append(sdf(pnts).detach().cpu().numpy())
     z = np.concatenate(z, axis=0)
 
-    if (not (np.min(z) > level or np.max(z) < level)):
+    if (not (np.nanmin(z) > level or np.nanmax(z) < level)) and not np.all(np.isnan(z)):
 
         z = z.astype(np.float32)
 
@@ -194,7 +194,7 @@ def get_surface_high_res_mesh(sdf, resolution=100, grid_boundary=[-2.0, 2.0], le
     z = np.concatenate(z, axis=0)
 
     meshexport = None
-    if (not (np.min(z) > level or np.max(z) < level)):
+    if (not (np.nanmin(z) > level or np.nanmax(z) < level)) and not np.all(np.isnan(z)):
 
         z = z.astype(np.float32)
 
@@ -284,7 +284,7 @@ def get_surface_by_grid(grid_params, sdf, resolution=100, level=0, higher_res=Fa
     z = np.concatenate(z, axis=0)
 
     meshexport = None
-    if (not (np.min(z) > level or np.max(z) < level)):
+    if (not (np.nanmin(z) > level or np.nanmax(z) < level)) and not np.all(np.isnan(z)):
 
         z = z.astype(np.float32)
 

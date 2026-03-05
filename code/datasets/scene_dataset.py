@@ -107,43 +107,75 @@ class SceneDataset(torch.utils.data.Dataset):
 
         # Load human masks - pixels to EXCLUDE from sampling
         human_mask_dir = '{0}/human_mask'.format(self.instance_dir)
+        # Sibling human_masks dir organized by camera: human_masks/<cam_id>/<frame:04d>.jpg
+        sibling_masks_dir = os.path.normpath(os.path.join(self.instance_dir, '..', 'human_masks'))
         self.human_mask_indices = []  # For each image, indices of pixels that are NOT human
-        if os.path.exists(human_mask_dir):
+
+        def _load_mask(path, rotate90=False):
+            """Load mask, optionally rotate 90° CCW, resize if needed, return flat valid indices."""
+            mask = Image.open(path).convert('L')
+            if rotate90:
+                mask = mask.rotate(90, expand=True)
+            if mask.size != (self.img_res[1], self.img_res[0]):  # PIL size is (W, H)
+                mask = mask.resize((self.img_res[1], self.img_res[0]), Image.NEAREST)
+            mask_flat = np.array(mask).reshape(-1)
+            # white (>127) = human → exclude; dark (<127) = background → keep
+            valid_indices = np.where(mask_flat < 127)[0]
+            return torch.from_numpy(valid_indices).long()
+
+        if self.multi_frame and os.path.exists(sibling_masks_dir):
+            # Multi-frame: load from human_masks/<cam_id>/<frame:04d>.jpg
+            cam_ids = sorted(
+                [int(d) for d in os.listdir(sibling_masks_dir)
+                 if os.path.isdir(os.path.join(sibling_masks_dir, d)) and d.isdigit()]
+            )
+            if len(cam_ids) == self.n_cameras:
+                print(f'Loading multi-frame human masks from {sibling_masks_dir} '
+                      f'({len(cam_ids)} cameras × {self.n_frames} frames)')
+                missing = 0
+                for frame_dir in self.frame_dirs:
+                    actual_frame = int(frame_dir.replace('frame_', ''))
+                    for cam_idx in range(self.n_cameras):
+                        cam_id = cam_ids[cam_idx]
+                        mask_path = os.path.join(sibling_masks_dir, str(cam_id), f'{actual_frame:04d}.jpg')
+                        if os.path.exists(mask_path):
+                            self.human_mask_indices.append(_load_mask(mask_path, rotate90=True))
+                        else:
+                            # No mask: sample all pixels for this image
+                            self.human_mask_indices.append(torch.arange(self.total_pixels))
+                            missing += 1
+                if missing:
+                    print(f'  Warning: {missing} masks missing, using all pixels for those images')
+            else:
+                print(f'Camera count mismatch in {sibling_masks_dir}: '
+                      f'found {len(cam_ids)}, expected {self.n_cameras}. '
+                      f'Sampling from all pixels.')
+        elif os.path.exists(human_mask_dir):
             if self.multi_frame:
-                # Multi-frame: load masks for each frame
+                # Multi-frame with scan-local human_mask/frame_XXXXX/ structure
                 for frame_dir in self.frame_dirs:
                     mask_frame_dir = os.path.join(human_mask_dir, frame_dir)
                     if os.path.exists(mask_frame_dir):
                         mask_paths = sorted(utils.glob_imgs(mask_frame_dir))
                         for path in mask_paths:
-                            mask = np.array(Image.open(path).convert('L'))
-                            if mask.shape != (self.img_res[0], self.img_res[1]):
-                                mask = np.array(Image.fromarray(mask).resize(
-                                    (self.img_res[1], self.img_res[0]), Image.NEAREST))
-                            mask_flat = mask.reshape(-1)
-                            valid_indices = np.where(mask_flat < 127)[0]
-                            self.human_mask_indices.append(torch.from_numpy(valid_indices).long())
+                            self.human_mask_indices.append(_load_mask(path))
             else:
                 # Single-frame mode
                 mask_paths = sorted(utils.glob_imgs(human_mask_dir))
                 if len(mask_paths) == self.n_images:
                     print(f'Loading {len(mask_paths)} human masks from {human_mask_dir}')
                     for path in mask_paths:
-                        mask = np.array(Image.open(path).convert('L'))
-                        if mask.shape != (self.img_res[0], self.img_res[1]):
-                            mask = np.array(Image.fromarray(mask).resize(
-                                (self.img_res[1], self.img_res[0]), Image.NEAREST))
-                        mask_flat = mask.reshape(-1)
-                        valid_indices = np.where(mask_flat < 127)[0]
-                        self.human_mask_indices.append(torch.from_numpy(valid_indices).long())
-            if len(self.human_mask_indices) > 0:
-                avg_valid = np.mean([len(m) for m in self.human_mask_indices])
-                print(f'Human masks loaded. Sampling from {avg_valid:.0f} pixels per image ({100*avg_valid/self.total_pixels:.1f}%)')
+                        self.human_mask_indices.append(_load_mask(path))
         else:
-            print(f'No human_mask directory at {human_mask_dir}, sampling from all pixels')
+            print(f'No human masks found, sampling from all pixels')
+
+        if len(self.human_mask_indices) > 0:
+            avg_valid = np.mean([len(m) for m in self.human_mask_indices])
+            print(f'Human masks loaded. Sampling from {avg_valid:.0f} pixels per image '
+                  f'({100*avg_valid/self.total_pixels:.1f}%)')
 
     def __len__(self):
-        return self.n_images
+        return len(self.rgb_images)
 
     def __getitem__(self, idx):
         uv = np.mgrid[0:self.img_res[0], 0:self.img_res[1]].astype(np.int32)

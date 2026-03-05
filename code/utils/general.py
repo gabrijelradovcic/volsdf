@@ -31,6 +31,7 @@ def split_input(model_input, total_pixels, n_pixels=10000):
         data['uv'] = torch.index_select(model_input['uv'], 1, indx)
         if 'object_mask' in data:
             data['object_mask'] = torch.index_select(model_input['object_mask'], 1, indx)
+        # frame_idx is per-batch, not per-pixel, keep as-is
         split.append(data)
     return split
 

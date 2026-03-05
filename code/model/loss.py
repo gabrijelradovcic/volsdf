@@ -4,9 +4,10 @@ import utils.general as utils
 
 
 class VolSDFLoss(nn.Module):
-    def __init__(self, rgb_loss, eikonal_weight):
+    def __init__(self, rgb_loss, eikonal_weight, pose_reg_weight=0.0):
         super().__init__()
         self.eikonal_weight = eikonal_weight
+        self.pose_reg_weight = pose_reg_weight
         self.rgb_loss = utils.get_class(rgb_loss)(reduction='mean')
 
     def get_rgb_loss(self,rgb_values, rgb_gt):
@@ -29,11 +30,16 @@ class VolSDFLoss(nn.Module):
 
         loss = rgb_loss + \
                self.eikonal_weight * eikonal_loss
+        
+        # Pose regularization (if multi-frame)
+        pose_reg_loss = model_outputs.get('pose_reg_loss', torch.tensor(0.0).cuda())
+        loss = loss + self.pose_reg_weight * pose_reg_loss
 
         output = {
             'loss': loss,
             'rgb_loss': rgb_loss,
             'eikonal_loss': eikonal_loss,
+            'pose_reg_loss': pose_reg_loss,
         }
 
         return output
